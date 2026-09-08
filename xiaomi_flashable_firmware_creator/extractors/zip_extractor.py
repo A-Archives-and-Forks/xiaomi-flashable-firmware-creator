@@ -2,7 +2,6 @@
 that deals with local zip files using zipfile standard library."""
 
 from pathlib import Path
-from typing import List, Union
 from zipfile import ZipFile
 
 from remotezip import RemoteZip
@@ -19,10 +18,10 @@ from xiaomi_flashable_firmware_creator.extractors.handlers.standard_zip import (
 class ZipExtractor:
     """ZipExtractor provides methods for dealing with local and remote zip files."""
 
-    zip_file_path: Union[Path, str]
+    zip_file_path: Path | str
     zip_file: str
     zip_url: str
-    handler: Union[StandardZip, PayloadZip]
+    handler: StandardZip | PayloadZip
 
     def __init__(self, zip_file, tmp_dir):
         """
@@ -43,7 +42,7 @@ class ZipExtractor:
         )
         self.handler = (
             PayloadZip(self.zip_file_path, tmp_dir, self._extractor)
-            if 'payload.bin' in str(self._extractor.namelist())
+            if 'payload.bin' in self._extractor.namelist()
             else StandardZip(self.zip_file_path, tmp_dir, self._extractor)
         )
 
@@ -79,7 +78,11 @@ class ZipExtractor:
         if isinstance(self.handler, PayloadZip):
             self.files = self.handler.prepare()
 
-    def extract(self, files_to_extract: List[str]):
+    def read(self, name: str) -> bytes:
+        """Read one entry from the source ROM."""
+        return self._extractor.read(name)
+
+    def extract(self, files_to_extract: list[str]):
         """
         Extract a list of files from the zip file
 
