@@ -1,61 +1,244 @@
 #!/sbin/sh
-# Xiaomi Firmware Updater Backend
-# by yshalsager
-# Based on TWRP A/B Installer Backend
-# by osm0sis, Dees_Troy and topjohnwu
 
-OUTFD=/proc/self/fd/$2
+OUTFD="/proc/self/fd/$2"
 ZIPFILE="$3"
+TARGET_DEVICES=[-]devices
+READONLY_BLOCKS=
+BLOCK_IDS=
+STAGED_IMAGE="/tmp/xffc-image-$$"
+umask 077
 
-ui_print() { $BOOTMODE && echo "$1" || echo -e "ui_print $1\nui_print" >> "$OUTFD"; }
-abort() { ui_print "$1"; exit 1; }
+ui_print() {
+  printf 'ui_print %s\nui_print\n' "$1" >> "$OUTFD"
+}
+
+abort() {
+  ui_print "$1"
+  exit 1
+}
+
+require_tools() {
+  for tool in blockdev dd getprop head readlink rm sed sha256sum stat tr unzip; do
+    command -v "$tool" >/dev/null 2>&1 || abort "[ERROR] Missing required command: $tool"
+  done
+  (set -o pipefail) 2>/dev/null || abort "[ERROR] Recovery shell does not support pipefail"
+  set -o pipefail
+
+  blockdev_help=$(blockdev --help 2>&1 || :)
+  for option in --getsize64 --getro --setrw --setro; do
+    case "$blockdev_help" in *"$option"*) ;; *)
+      abort "[ERROR] blockdev does not support $option" ;;
+    esac
+  done
+
+  probe="/tmp/xffc-dd-probe-$$"
+  printf x | dd of="$probe" bs=1 conv=fsync >/dev/null 2>&1 || {
+    rm -f "$probe"
+    abort "[ERROR] dd does not support conv=fsync"
+  }
+  [ "$(dd if="$probe" iflag=count_bytes count=1 2>/dev/null)" = x ] || {
+    rm -f "$probe"
+    abort "[ERROR] dd does not support byte-count reads"
+  }
+  rm -f "$probe"
+}
+
+is_target_device() {
+  value="$1"
+  for target in $TARGET_DEVICES; do
+    [ "$value" = "$target" ] && return 0
+  done
+  return 1
+}
+
+is_target_device_list() {
+  values=$(printf '%s' "$1" | tr '|,:' '\n\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  while IFS= read -r value; do
+    is_target_device "$value" && return 0
+  done <<EOF
+$values
+EOF
+  return 1
+}
+
+validate_device() {
+  for property in ro.product.device ro.product.name ro.product.vendor.device; do
+    is_target_device "$(getprop "$property" 2>/dev/null)" && return 0
+  done
+  is_target_device_list "$(getprop ro.twrp.target.devices 2>/dev/null)" && return 0
+  abort "[ERROR] This firmware is only for: $TARGET_DEVICES"
+}
+
+read_bootarg() {
+  key="$1"
+  for source in /proc/cmdline /proc/bootconfig; do
+    [ -r "$source" ] || continue
+    value=$(
+      sed -e 's/ = /=/g' -e 's/"//g' "$source" |
+        tr ' ' '\n' |
+        sed -n "s/^${key}=//p" |
+        head -n 1
+    )
+    [ -n "$value" ] && printf '%s\n' "$value" && return 0
+  done
+  return 1
+}
+
+set_slots() {
+  active=$(getprop ro.boot.slot_suffix 2>/dev/null)
+  [ -n "$active" ] || active=$(getprop ro.boot.slot 2>/dev/null)
+  [ -n "$active" ] || active=$(read_bootarg androidboot.slot_suffix)
+  [ -n "$active" ] || active=$(read_bootarg androidboot.slot)
+
+  case "$active" in
+    a|_a) ACTIVE_SLOT=a; INACTIVE_SLOT=b ;;
+    b|_b) ACTIVE_SLOT=b; INACTIVE_SLOT=a ;;
+    *) abort "[ERROR] Unable to determine active slot" ;;
+  esac
+}
+
+check_image() {
+  partition="$1"
+  expected_hash="$2"
+  image="firmware-update/$partition.img"
+  output=$(unzip -p "$ZIPFILE" "$image" | sha256sum) ||
+    abort "[ERROR] Could not read firmware image: $partition"
+  actual_hash=${output%% *}
+  [ "$actual_hash" = "$expected_hash" ] ||
+    abort "[ERROR] Invalid firmware image: $partition"
+}
+
+resolve_partition() {
+  partition="$1"
+  slot="$2"
+  for root in \
+    /dev/block/by-name \
+    /dev/block/bootdevice/by-name \
+    /dev/block/platform/*/by-name
+  do
+    block="$root/${partition}_${slot}"
+    if [ -b "$block" ]; then
+      readlink -f "$block"
+      return
+    fi
+  done
+  return 1
+}
+
+restore_readonly() {
+  result=0
+  for block in $READONLY_BLOCKS; do
+    blockdev --setro "$block" >/dev/null 2>&1 || result=1
+  done
+  return "$result"
+}
+
+cleanup() {
+  restore_readonly
+  rm -f "$STAGED_IMAGE"
+}
+
+preflight_partition() {
+  partition="$1"
+  image_size="$2"
+
+  for slot in a b; do
+    block=$(resolve_partition "$partition" "$slot") ||
+      abort "[ERROR] Missing block device: ${partition}_${slot}"
+    device_id=$(stat -L -c '%t:%T' "$block" 2>/dev/null) ||
+      abort "[ERROR] Could not identify block device: ${partition}_${slot}"
+    case " $BLOCK_IDS " in
+      *" $device_id "*) abort "[ERROR] Duplicate block device: ${partition}_${slot}" ;;
+    esac
+    BLOCK_IDS="$BLOCK_IDS $device_id"
+    eval "BLOCK_${partition}_${slot}=\$block"
+    eval "BLOCK_ID_${partition}_${slot}=\$device_id"
+
+    block_size=$(blockdev --getsize64 "$block" 2>/dev/null) ||
+      abort "[ERROR] Could not read partition size: ${partition}_${slot}"
+    case "$block_size" in
+      ''|*[!0-9]*) abort "[ERROR] Invalid partition size: ${partition}_${slot}" ;;
+    esac
+    [ "$image_size" -le "$block_size" ] ||
+      abort "[ERROR] Image is larger than partition: ${partition}_${slot}"
+
+    read_only=$(blockdev --getro "$block" 2>/dev/null) ||
+      abort "[ERROR] Could not read partition state: ${partition}_${slot}"
+    case "$read_only" in
+      0) ;;
+      1)
+        blockdev --setrw "$block" >/dev/null 2>&1 ||
+          abort "[ERROR] Could not make partition writable: ${partition}_${slot}"
+        READONLY_BLOCKS="$READONLY_BLOCKS $block"
+        [ "$(blockdev --getro "$block" 2>/dev/null)" = 0 ] ||
+          abort "[ERROR] Partition is read-only: ${partition}_${slot}"
+        ;;
+      *) abort "[ERROR] Invalid partition state: ${partition}_${slot}" ;;
+    esac
+  done
+}
+
+flash_partition() {
+  partition="$1"
+  image_size="$2"
+  expected_hash="$3"
+  slot="$4"
+  image="firmware-update/$partition.img"
+  eval "block=\$BLOCK_${partition}_${slot}"
+  eval "expected_device_id=\$BLOCK_ID_${partition}_${slot}"
+
+  unzip -p "$ZIPFILE" "$image" > "$STAGED_IMAGE" ||
+    abort "[ERROR] Could not stage firmware image: $partition"
+  [ "$(stat -c '%s' "$STAGED_IMAGE" 2>/dev/null)" = "$image_size" ] ||
+    abort "[ERROR] Staged image has wrong size: $partition"
+  output=$(sha256sum "$STAGED_IMAGE") || abort "[ERROR] Could not hash staged image: $partition"
+  actual_hash=${output%% *}
+  [ "$actual_hash" = "$expected_hash" ] || abort "[ERROR] Invalid staged image: $partition"
+
+  [ -b "$block" ] || abort "[ERROR] Block device disappeared: ${partition}_${slot}"
+  [ "$(stat -L -c '%t:%T' "$block" 2>/dev/null)" = "$expected_device_id" ] ||
+    abort "[ERROR] Block device changed: ${partition}_${slot}"
+  ui_print "[INFO] Updating ${partition}_${slot}..."
+  dd if="$STAGED_IMAGE" of="$block" bs=1048576 conv=fsync ||
+    abort "[ERROR] Failed to flash ${partition}_${slot}"
+  rm -f "$STAGED_IMAGE"
+
+  output=$(dd if="$block" iflag=count_bytes count="$image_size" 2>/dev/null | sha256sum) ||
+    abort "[ERROR] Failed to verify ${partition}_${slot}"
+  actual_hash=${output%% *}
+  [ "$actual_hash" = "$expected_hash" ] ||
+    abort "[ERROR] Verification failed: ${partition}_${slot}"
+}
+
+flash_slot() {
+  slot="$1"
+[-]flash_lines
+}
+
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
 
 ui_print "####################################################"
 ui_print "# Generated by Xiaomi Flashable Firmware Creator"
-ui_print "# [-]datetime - [-]host"
 ui_print "####################################################"
 ui_print " "
 
-# Check the activate slot and set suffixes
-if [ "$(getprop ro.boot.slot_suffix)" = "_a" ]
-then
-  currentSlot="a"
-#  inactiveSlot="b"
-else
-  currentSlot="b"
-#  inactiveSlot="a"
-fi
+require_tools
+validate_device
+set_slots
+rm -f "$STAGED_IMAGE"
 
-# Check if the active slot variable is set
-[ -z "$currentSlot" ] && echo abort "[ERROR] Unable to detect activate slot! Aborting."
+[-]image_check_lines
 
-# /dev/tmp is safe for firmware installs
-tmp=/dev/tmp/fw-install
-backupDir=/sdcard/XFU/$currentSlot
+[-]preflight_lines
 
-# Extract firmware files
-ui_print "[INFO] Unpacking firmware files...";
-ui_print " "
-rm -rf $tmp
-mkdir -p $tmp
-unzip -o "$ZIPFILE" -d $tmp || abort "[ERROR] Failed to extract zip! Check recovery logs."
+ui_print "[INFO] Updating inactive slot $INACTIVE_SLOT first..."
+flash_slot "$INACTIVE_SLOT"
+ui_print "[INFO] Updating active slot $ACTIVE_SLOT..."
+flash_slot "$ACTIVE_SLOT"
 
-# Create backup folder
-rm -rf $backupDir
-mkdir -p $backupDir
-
-# Flash files
-for firmwareFile in "$tmp"/*.img; do
-  partitionFileName=${firmwareFile##*/}
-  partitionName=${partitionFileName%.*}
-  ui_print "[INFO] Making a backup of $partitionName\_$currentSlot..."
-  dd if=/dev/block/bootdevice/by-name/"$partitionName"_$currentSlot of=$backupDir/"$partitionFileName"
-  ui_print "[INFO] Flashing $partitionName on slot $currentSlot..."
-  dd if="$firmwareFile" of=/dev/block/bootdevice/by-name/"$partitionName"_$currentSlot || abort "[ERROR] Unable to flash $partitionName! Aborting."
-done;
-
-# Cleanup
-ui_print "[INFO] Cleaning up..."
-cd /
-rm -rf /dev/tmp/fw-install
-ui_print "[INFO] Firmware has been successfully updated!"
+restore_readonly || abort "[ERROR] Failed to restore partition read-only state"
+READONLY_BLOCKS=
+rm -f "$STAGED_IMAGE"
+trap - 0
+ui_print "Firmware has been successfully updated!"

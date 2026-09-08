@@ -1,3 +1,0 @@
-ui_print("Updating [-]partition...");
-package_extract_file("firmware-update/[-]partition.img", "/dev/block/bootdevice/by-name/[-]{partition}_a");
-package_extract_file("firmware-update/[-]partition.img", "/dev/block/bootdevice/by-name/[-]{partition}_b");

@@ -11,10 +11,12 @@ Using extract, generate_updater_script, and make_zip you can create
 # pylint: disable=too-many-instance-attributes
 import re
 from datetime import datetime
-from hashlib import md5
+from hashlib import file_digest, md5
 from pathlib import Path
-from shutil import copy2, make_archive, rmtree
+from shlex import quote
+from shutil import make_archive, rmtree
 from socket import gethostname
+from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
 from xiaomi_flashable_firmware_creator import work_dir
 from xiaomi_flashable_firmware_creator.extractors.handlers.payload_zip import PayloadZip
@@ -349,42 +351,66 @@ class FlashableFirmwareCreator:
             )
             if vendor_resize:
                 write_text_to_file(
-                    f'{str(self._tmp_dir)}/dynamic_partitions_op_list',
+                    f'{self._tmp_dir!s}/dynamic_partitions_op_list',
                     vendor_resize.group(1),
                 )
 
-    # def generate_update_binary(self):
-    #     """
-    #     Generate the new zip update-binary and write it to the temporary directory.
-    #
-    #     :return:
-    #     """
-    #     template = ScriptTemplate(Path(
-    #         Path(__file__).parent / 'templates/recovery_update-binary').read_text())
-    #     update_binary_text = template.substitute(datetime=self.datetime, host=self.host)
-    #     update_binary = Path(f"{str(self._flashing_script_dir)}/update-binary")
-    #     update_binary.write_text(update_binary_text)
-    #     update_binary.chmod(775)
+    def get_payload_devices(self) -> list[str]:
+        try:
+            metadata = self.extractor.read('META-INF/com/android/metadata').decode()
+        except (KeyError, UnicodeDecodeError) as error:
+            raise RuntimeError('Payload ROM has no valid OTA metadata!') from error
 
-    def generate_ab_updater_script(self, invalid_files: set[str]):
-        script_template = ScriptTemplate(
-            Path(Path(__file__).parent / 'templates/recovery_ab_updater_script').read_text()
+        properties = dict(line.split('=', 1) for line in metadata.splitlines() if '=' in line)
+        if properties.get('ota-type') != 'AB':
+            raise RuntimeError('Payload ROM metadata does not declare ota-type=AB!')
+
+        devices = sorted(
+            filter(
+                None,
+                (device.strip() for device in re.split(r'[|,:]', properties.get('pre-device', ''))),
+            )
         )
-        flashing_template = ScriptTemplate(
-            Path(Path(__file__).parent / 'templates/partition_flashing').read_text()
+        if not devices or any(not re.fullmatch(r'[A-Za-z0-9_.-]+', device) for device in devices):
+            raise RuntimeError('Payload ROM metadata has no valid pre-device!')
+        return devices
+
+    def generate_ab_flashing_scripts(self):
+        def digest(file: Path) -> str:
+            with file.open('rb') as stream:
+                return file_digest(stream, 'sha256').hexdigest()
+
+        image_files = list((self._tmp_dir / 'firmware-update').glob('*.img'))
+        for file in image_files:
+            if not file.stat().st_size:
+                file.unlink()
+        images = sorted(
+            (file.stem, file.stat().st_size, digest(file)) for file in image_files if file.exists()
         )
-        lines = [
-            flashing_template.substitute(partition=file.split('/')[-1].split('.')[0])
-            for file in self.get_files_list()
-            if file.startswith('firmware-update/') and file not in invalid_files
-        ]
-        updater_script = script_template.substitute(
-            datetime=self.datetime,
-            host=self.host,
-            zip_name=self.extractor.get_file_name(),
-            lines='\n'.join(lines),
+        if not images:
+            raise RuntimeError('No firmware images found to flash!')
+        if any(not re.fullmatch(r'[A-Za-z0-9_]+', partition) for partition, _, _ in images):
+            raise RuntimeError('Payload contains an invalid partition name!')
+        devices = self.get_payload_devices()
+        update_binary_template = ScriptTemplate(
+            Path(Path(__file__).parent / 'templates/recovery_ab_update-binary').read_text()
         )
-        write_text_to_file(f'{str(self._flashing_script_dir)}/updater-script', updater_script)
+        update_binary = update_binary_template.substitute(
+            devices=quote(' '.join(devices)),
+            image_check_lines='\n'.join(
+                f'check_image {quote(partition)} {digest}' for partition, _, digest in images
+            ),
+            preflight_lines='\n'.join(
+                f'preflight_partition {quote(partition)} {size}' for partition, size, _ in images
+            ),
+            flash_lines='\n'.join(
+                f'flash_partition {quote(partition)} {size} {digest} "$slot"'
+                for partition, size, digest in images
+            ),
+        )
+        update_binary_path = self._flashing_script_dir / 'update-binary'
+        write_text_to_file(update_binary_path, update_binary)
+        update_binary_path.chmod(0o755)
 
     def generate_flashing_script(self, invalid_files: set[str]):
         """
@@ -392,11 +418,7 @@ class FlashableFirmwareCreator:
         :return:
         """
         if self.uses_payload is True:
-            self.generate_ab_updater_script(invalid_files)
-            copy2(
-                Path(Path(__file__).parent / 'binaries/update-binary'),
-                f'{str(self._flashing_script_dir)}/update-binary',
-            )
+            self.generate_ab_flashing_scripts()
         else:
             self.generate_updater_script(invalid_files)
 
@@ -408,7 +430,28 @@ class FlashableFirmwareCreator:
         :return:
         """
         out = Path(f'{self._out_dir}/result.zip')
-        make_archive(str(out.with_suffix('').absolute()), 'zip', self._tmp_dir)
+        if self.uses_payload:
+            with ZipFile(out, 'w', ZIP_DEFLATED, allowZip64=True) as archive:
+                for file in self._tmp_dir.rglob('*'):
+                    archive.write(file, file.relative_to(self._tmp_dir))
+            try:
+                with ZipFile(out) as archive:
+                    infos = archive.infolist()
+                    names = [info.filename for info in infos]
+                    images = [info for info in infos if info.filename.endswith('.img')]
+                    if (
+                        archive.testzip()
+                        or names.count('META-INF/com/google/android/update-binary') != 1
+                        or 'META-INF/com/android/metadata' in names
+                        or not images
+                        or len(images) != len({info.filename for info in images})
+                        or any(info.compress_type != ZIP_DEFLATED for info in images)
+                    ):
+                        raise RuntimeError('Generated firmware archive is invalid!')
+            except BadZipFile as error:
+                raise RuntimeError('Generated firmware archive is invalid!') from error
+        else:
+            make_archive(str(out.with_suffix('').absolute()), 'zip', self._tmp_dir)
         if not out.exists():
             raise RuntimeError('Could not create result zip file!')
         if not self.uses_payload:
