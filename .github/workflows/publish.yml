@@ -32,7 +32,7 @@ jobs:
             uv-${{ runner.os }}
       - uses: jdx/mise-action@v4
         with:
-          version: 2026.9.2
+          minimum_release_age: 7d
           experimental: true
       - name: Build
         run: uv build
